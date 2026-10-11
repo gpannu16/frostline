@@ -1,89 +1,54 @@
 
-name: Pipeline
-
-on:
-  pull_request:
-  push:
-    branches: [main]
-  workflow_dispatch:
-
-permissions:
-  contents: read
-
-jobs:
-  test:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      checks: write
-      pull-requests: write
-
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt -r requirements-dev.txt
-
-      - name: Run tests
-        run: python -m pytest -v --junitxml=test-results.xml
-
-      - name: Publish test results
-        uses: EnricoMi/publish-unit-test-result-action@v2
-        if: ${{ !cancelled() }}
-        with:
-          files: test-results.xml
-
-  deploy:
-    needs: test
-    if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-      contents: read
-
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v6
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: us-west-2
-          mask-aws-account-id: true
-
-      - name: Log in to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Build and push Docker image
-        env:
-          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          IMAGE_TAG: ${{ github.sha }}
-        run: |
-          docker build \
-            --build-arg GIT_SHA=${IMAGE_TAG} \
-            -t ${REGISTRY}/frostline:${IMAGE_TAG} .
-          docker push ${REGISTRY}/frostline:${IMAGE_TAG}
-
-      - name: Render ECS task definition
-        id: render-task
-        uses: aws-actions/amazon-ecs-render-task-definition@v1
-        with:
-          task-definition-family: frostline
-          container-name: frostline
-          image: ${{ steps.login-ecr.outputs.registry }}/frostline:${{ github.sha }}
-
       - name: Deploy to Amazon ECS
+        id: ecs-deploy
         uses: aws-actions/amazon-ecs-deploy-task-definition@v2
         with:
           task-definition: ${{ steps.render-task.outputs.task-definition }}
           cluster: frostline-cluster
           service: frostline-api
           wait-for-service-stability: true
+          wait-max-delay-seconds: 15
+
+      - name: Confirm ECS rollout completed
+        env:
+          EXPECTED_TASK_DEFINITION: ${{ steps.ecs-deploy.outputs.task-definition-arn }}
+        run: |
+          for attempt in $(seq 1 90); do
+            SERVICE=$(aws ecs describe-services \
+              --cluster frostline-cluster \
+              --services frostline-api \
+              --region us-west-2 \
+              --output json)
+
+            PRIMARY_TASK=$(echo "$SERVICE" | jq -r \
+              '.services[0].deployments[] | select(.status == "PRIMARY") | .taskDefinition')
+
+            ROLLOUT=$(echo "$SERVICE" | jq -r \
+              '.services[0].deployments[] | select(.status == "PRIMARY") | .rolloutState // "UNKNOWN"')
+
+            RUNNING=$(echo "$SERVICE" | jq -r '.services[0].runningCount')
+            DESIRED=$(echo "$SERVICE" | jq -r '.services[0].desiredCount')
+            PENDING=$(echo "$SERVICE" | jq -r '.services[0].pendingCount')
+
+            echo "Expected: $EXPECTED_TASK_DEFINITION"
+            echo "Primary: $PRIMARY_TASK | Rollout: $ROLLOUT | Running: $RUNNING/$DESIRED | Pending: $PENDING"
+
+            if [ "$ROLLOUT" = "FAILED" ]; then
+              echo "ECS deployment rollout failed."
+              exit 1
+            fi
+
+            if [ "$PRIMARY_TASK" = "$EXPECTED_TASK_DEFINITION" ] && \
+               [ "$ROLLOUT" = "COMPLETED" ] && \
+               [ "$RUNNING" -eq "$DESIRED" ] && \
+               [ "$PENDING" -eq 0 ]; then
+              echo "Expected task definition is fully deployed."
+              exit 0
+            fi
+
+            sleep 10
+          done
+
+          echo "Timed out waiting for the expected ECS rollout to complete."
+          exit 1
 
